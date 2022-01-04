@@ -2,6 +2,7 @@
 
 ``activate``
 ============
+          
 Once :ref:`ceph-volume-lvm-prepare` is completed, and all the various steps
 that entails are done, the volume is ready to get "activated".
 
@@ -12,6 +13,9 @@ understand what OSD is enabled and needs to be mounted.
 .. note:: The execution of this call is fully idempotent, and there is no
           side-effects when running multiple times
 
+For OSDs deployed by cephadm, please refer to :ref:cephadm-osd-activate: 
+instead.
+
 New OSDs
 --------
 To activate newly prepared OSDs both the :term:`OSD id` and :term:`OSD uuid`
@@ -19,14 +23,37 @@ need to be supplied. For example::
 
     ceph-volume lvm activate --bluestore 0 0263644D-0BF1-4D6D-BC34-28BD98AE3BC8
 
-.. note:: The UUID is stored in the ``osd_fsid`` file in the OSD path, which is
+.. note:: The UUID is stored in the ``fsid`` file in the OSD path, which is
           generated when :ref:`ceph-volume-lvm-prepare` is used.
+
+Activating all OSDs
+-------------------
+
+.. note:: For OSDs deployed by cephadm, please refer to :ref:cephadm-osd-activate: 
+          instead.
+
+It is possible to activate all existing OSDs at once by using the ``--all``
+flag. For example::
+
+    ceph-volume lvm activate --all
+
+This call will inspect all the OSDs created by ceph-volume that are inactive
+and will activate them one by one. If any of the OSDs are already running, it
+will report them in the command output and skip them, making it safe to rerun
+(idempotent).
 
 requiring uuids
 ^^^^^^^^^^^^^^^
 The :term:`OSD uuid` is being required as an extra step to ensure that the
 right OSD is being activated. It is entirely possible that a previous OSD with
 the same id exists and would end up activating the incorrect one.
+
+
+dmcrypt
+^^^^^^^
+If the OSD was prepared with dmcrypt by ceph-volume, there is no need to
+specify ``--dmcrypt`` on the command line again (that flag is not available for
+the ``activate`` subcommand). An encrypted OSD will be automatically detected.
 
 
 Discovery
@@ -67,9 +94,11 @@ ensure that the correct device is linked.
 
 Existing OSDs
 -------------
-For exsiting OSDs that have been deployed with different tooling, the only way
-to port them over to the new mechanism is to prepare them again (losing data).
-See :ref:`ceph-volume-lvm-existing-osds` for details on how to proceed.
+For existing OSDs that have been deployed with ``ceph-disk``, they need to be
+scanned and activated :ref:`using the simple sub-command <ceph-volume-simple>`.
+If a different tooling was used then the only way to port them over to the new
+mechanism is to prepare them again (losing data). See
+:ref:`ceph-volume-lvm-existing-osds` for details on how to proceed.
 
 Summary
 -------
