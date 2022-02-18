@@ -15,7 +15,6 @@
 #include "include/buffer.h"
 #include "include/denc.h"
 
-#include "crimson/common/log.h"
 #include "crimson/os/seastore/extent_reader.h"
 #include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/ordering_handle.h"
@@ -64,9 +63,7 @@ public:
     crimson::ct_error::input_output_error
     >;
   using open_for_write_ret = open_for_write_ertr::future<journal_seq_t>;
-  open_for_write_ret open_for_write() {
-    return journal_segment_manager.open();
-  }
+  open_for_write_ret open_for_write();
 
   /**
    * close journal
@@ -75,10 +72,7 @@ public:
    */
   using close_ertr = crimson::errorator<
     crimson::ct_error::input_output_error>;
-  close_ertr::future<> close() {
-    metrics.clear();
-    return journal_segment_manager.close();
-  }
+  close_ertr::future<> close();
 
   /**
    * submit_record
@@ -97,6 +91,17 @@ public:
     OrderingHandle &handle
   ) {
     return record_submitter.submit(std::move(record), handle);
+  }
+
+  /**
+   * flush
+   *
+   * Wait for all outstanding IOs on handle to commit.
+   * Note, flush() machinery must go through the same pipeline
+   * stages and locks as submit_record.
+   */
+  seastar::future<> flush(OrderingHandle &handle) {
+    return record_submitter.flush(handle);
   }
 
   /**
@@ -131,7 +136,11 @@ private:
                      size_t(segment_manager.get_block_size()));
     }
 
-    segment_off_t get_block_size() const {
+    device_id_t get_device_id() const {
+      return segment_manager.get_device_id();
+    }
+
+    seastore_off_t get_block_size() const {
       return segment_manager.get_block_size();
     }
 
@@ -157,11 +166,7 @@ private:
 
     using open_ertr = base_ertr;
     using open_ret = open_ertr::future<journal_seq_t>;
-    open_ret open() {
-      return roll().safe_then([this] {
-        return get_current_write_seq();
-      });
-    }
+    open_ret open();
 
     using close_ertr = base_ertr;
     close_ertr::future<> close();
@@ -214,7 +219,7 @@ private:
     segment_nonce_t current_segment_nonce;
 
     SegmentRef current_journal_segment;
-    segment_off_t written_to;
+    seastore_off_t written_to;
     // committed_to may be in a previous journal segment
     journal_seq_t committed_to;
   };
@@ -287,6 +292,7 @@ private:
     using add_pending_ret = add_pending_ertr::future<record_locator_t>;
     add_pending_ret add_pending(
         record_t&&,
+        OrderingHandle&,
         extent_len_t block_size);
 
     // Encode the batched records for write.
@@ -326,12 +332,12 @@ private:
 
     record_group_t pending;
     std::size_t submitting_size = 0;
-    segment_off_t submitting_length = 0;
-    segment_off_t submitting_mdlength = 0;
+    seastore_off_t submitting_length = 0;
+    seastore_off_t submitting_mdlength = 0;
 
     struct promise_result_t {
       write_result_t write_result;
-      segment_off_t mdlength;
+      seastore_off_t mdlength;
     };
     using maybe_promise_result_t = std::optional<promise_result_t>;
     std::optional<seastar::shared_promise<maybe_promise_result_t> > io_promise;
@@ -392,6 +398,7 @@ private:
 
     using submit_ret = Journal::submit_record_ret;
     submit_ret submit(record_t&&, OrderingHandle&);
+    seastar::future<> flush(OrderingHandle &handle);
 
   private:
     void update_state();
@@ -402,24 +409,7 @@ private:
       update_state();
     }
 
-    void decrement_io_with_flush() {
-      assert(num_outstanding_io > 0);
-      --num_outstanding_io;
-#ifndef NDEBUG
-      auto prv_state = state;
-#endif
-      update_state();
-
-      if (wait_submit_promise.has_value()) {
-        assert(prv_state == state_t::FULL);
-        wait_submit_promise->set_value();
-        wait_submit_promise.reset();
-      }
-
-      if (!p_current_batch->is_empty()) {
-        flush_current_batch();
-      }
-    }
+    void decrement_io_with_flush();
 
     void pop_free_batch() {
       assert(p_current_batch == nullptr);

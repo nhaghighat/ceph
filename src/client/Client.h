@@ -875,8 +875,6 @@ public:
     return std::make_pair(opened_inodes, inode_map.size());
   }
 
-  xlist<Inode*> &get_dirty_list() { return dirty_list; }
-
   /* timer_lock for 'timer' */
   ceph::mutex timer_lock = ceph::make_mutex("Client::timer_lock");
   SafeTimer timer;
@@ -1240,6 +1238,8 @@ private:
   struct VXattr {
     const std::string name;
     size_t (Client::*getxattr_cb)(Inode *in, char *val, size_t size);
+    int (Client::*setxattr_cb)(Inode *in, const void *val, size_t size,
+			       const UserPerm& perms);
     bool readonly;
     bool (Client::*exists_cb)(Inode *in);
     unsigned int flags;
@@ -1320,7 +1320,8 @@ private:
   int _mknod(Inode *dir, const char *name, mode_t mode, dev_t rdev,
 	     const UserPerm& perms, InodeRef *inp = 0);
   int _do_setattr(Inode *in, struct ceph_statx *stx, int mask,
-		  const UserPerm& perms, InodeRef *inp);
+		  const UserPerm& perms, InodeRef *inp,
+		  std::vector<uint8_t>* aux=nullptr);
   void stat_to_statx(struct stat *st, struct ceph_statx *stx);
   int __setattrx(Inode *in, struct ceph_statx *stx, int mask,
 		 const UserPerm& perms, InodeRef *inp = 0);
@@ -1394,6 +1395,12 @@ private:
 
   vinodeno_t _get_vino(Inode *in);
 
+  bool _vxattrcb_fscrypt_auth_exists(Inode *in);
+  size_t _vxattrcb_fscrypt_auth(Inode *in, char *val, size_t size);
+  int _vxattrcb_fscrypt_auth_set(Inode *in, const void *val, size_t size, const UserPerm& perms);
+  bool _vxattrcb_fscrypt_file_exists(Inode *in);
+  size_t _vxattrcb_fscrypt_file(Inode *in, char *val, size_t size);
+  int _vxattrcb_fscrypt_file_set(Inode *in, const void *val, size_t size, const UserPerm& perms);
   bool _vxattrcb_quota_exists(Inode *in);
   size_t _vxattrcb_quota(Inode *in, char *val, size_t size);
   size_t _vxattrcb_quota_max_bytes(Inode *in, char *val, size_t size);
@@ -1530,8 +1537,7 @@ private:
   // cap flushing
   ceph_tid_t last_flush_tid = 1;
 
-  // dirty_list keeps all the dirty inodes before flushing.
-  xlist<Inode*> delayed_list, dirty_list;
+  xlist<Inode*> delayed_list;
   int num_flushing_caps = 0;
   ceph::unordered_map<inodeno_t,SnapRealm*> snap_realms;
   std::map<std::string, std::string> metadata;

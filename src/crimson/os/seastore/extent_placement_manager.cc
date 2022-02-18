@@ -1,28 +1,25 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 smarttab expandtab
 
-#include "crimson/os/seastore/journal.h"
 #include "crimson/os/seastore/extent_placement_manager.h"
+
+#include "crimson/os/seastore/segment_cleaner.h"
 
 namespace {
   seastar::logger& logger() {
-    return crimson::get_logger(ceph_subsys_seastore);
+    return crimson::get_logger(ceph_subsys_seastore_tm);
   }
 }
+
+SET_SUBSYS(seastore_tm);
 
 namespace crimson::os::seastore {
 
 SegmentedAllocator::SegmentedAllocator(
   SegmentProvider& sp,
-  SegmentManager& sm,
-  LBAManager& lba_manager,
-  Journal& journal,
-  Cache& cache)
+  SegmentManager& sm)
   : segment_provider(sp),
-    segment_manager(sm),
-    lba_manager(lba_manager),
-    journal(journal),
-    cache(cache)
+    segment_manager(sm)
 {
   std::generate_n(
     std::back_inserter(writers),
@@ -31,39 +28,8 @@ SegmentedAllocator::SegmentedAllocator(
     [&] {
       return Writer{
 	segment_provider,
-	segment_manager,
-	lba_manager,
-	journal,
-        cache};
+	segment_manager};
       });
-}
-
-SegmentedAllocator::Writer::finish_record_ret
-SegmentedAllocator::Writer::finish_write(
-  Transaction& t,
-  ool_record_t& record) {
-  return trans_intr::do_for_each(record.get_extents(),
-    [this, &t](auto& ool_extent) {
-    LOG_PREFIX(SegmentedAllocator::Writer::finish_write);
-    auto& lextent = ool_extent.get_lextent();
-    DEBUGT("extent: {}, ool_paddr: {}",
-      t,
-      *lextent,
-      ool_extent.get_ool_paddr());
-    return lba_manager.update_mapping(
-      t,
-      lextent->get_laddr(),
-      lextent->get_paddr(),
-      ool_extent.get_ool_paddr()
-    ).si_then([&ool_extent, &t, &lextent, this] {
-      lextent->backend_type = device_type_t::NONE;
-      lextent->hint = {};
-      cache.mark_delayed_extent_ool(t, lextent, ool_extent.get_ool_paddr());
-      return finish_record_iertr::now();
-    });
-  }).si_then([&record] {
-    record.clear();
-  });
 }
 
 SegmentedAllocator::Writer::write_iertr::future<>
@@ -103,10 +69,9 @@ SegmentedAllocator::Writer::_write(
 
   return trans_intr::make_interruptible(
     current_segment->segment->write(record.get_base(), bl).safe_then(
-      [this, pr=std::move(pr), &t,
-      it=(--current_segment->inflight_writes.end()),
-      cs=current_segment]() mutable {
-        LOG_PREFIX(SegmentedAllocator::Writer::_write);
+      [this, FNAME, pr=std::move(pr), &t,
+       it=(--current_segment->inflight_writes.end()),
+       cs=current_segment]() mutable {
         if (cs->outdated) {
           DEBUGT("segment rolled", t);
           pr.set_value();
@@ -116,8 +81,15 @@ SegmentedAllocator::Writer::_write(
         }
         return seastar::now();
     })
-  ).si_then([this, &record, &t]() mutable {
-    return finish_write(t, record);
+  ).si_then([FNAME, &record, &t] {
+    for (auto& ool_extent : record.get_extents()) {
+      auto& lextent = ool_extent.get_lextent();
+      auto paddr = ool_extent.get_ool_paddr();
+      TRACET("ool extent written at {} -- {}", t, *lextent, paddr);
+      lextent->hint = {};
+      t.mark_delayed_extent_ool(lextent, paddr);
+    }
+    record.clear();
   });
 }
 
@@ -215,7 +187,7 @@ SegmentedAllocator::Writer::write(
   return write_func();
 }
 
-bool SegmentedAllocator::Writer::_needs_roll(segment_off_t length) const {
+bool SegmentedAllocator::Writer::_needs_roll(seastore_off_t length) const {
   return allocated_to + length > current_segment->segment->get_write_capacity();
 }
 
@@ -226,9 +198,9 @@ SegmentedAllocator::Writer::init_segment(Segment& segment) {
       segment_manager.get_block_size()));
   bp.zero();
   auto header =segment_header_t{
-    journal.get_segment_seq(),
+    OOL_SEG_SEQ,
     segment.get_segment_id(),
-    NO_DELTAS, 0, true};
+    NO_DELTAS, 0};
   logger().debug("SegmentedAllocator::Writer::init_segment: initting {}, {}",
     segment.get_segment_id(),
     header);
@@ -280,7 +252,7 @@ SegmentedAllocator::Writer::roll_segment(bool set_rolling) {
   }
 
   return segment_provider.get_segment(
-    segment_manager.get_device_id()
+    segment_manager.get_device_id(), OOL_SEG_SEQ
   ).safe_then([this](auto segment) {
     return segment_manager.open(segment);
   }).safe_then([this](auto segref) {

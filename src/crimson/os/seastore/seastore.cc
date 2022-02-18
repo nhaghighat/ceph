@@ -35,6 +35,8 @@
 using std::string;
 using crimson::common::local_conf;
 
+SET_SUBSYS(seastore);
+
 namespace crimson::os::seastore {
 
 class FileMDStore final : public SeaStore::MDStore {
@@ -153,11 +155,13 @@ SeaStore::mount_ertr::future<> SeaStore::mount()
       device_id_t id = device_entry.first;
       magic_t magic = device_entry.second.magic;
       device_type_t dtype = device_entry.second.dtype;
+      std::ostringstream oss;
+      oss << root << "/block." << dtype << "." << std::to_string(id);
       auto sm = std::make_unique<
-	segment_manager::block::BlockSegmentManager>(
-	  root + "/block." + device_type_to_string(dtype)
-	  + "." + std::to_string(id));
-      return sm->mount().safe_then([this, sm=std::move(sm), magic]() mutable {
+	segment_manager::block::BlockSegmentManager>(oss.str());
+      return sm->mount().safe_then(
+	[this, sm=std::move(sm), magic]() mutable {
+	boost::ignore_unused(magic);  // avoid clang warning;
 	assert(sm->get_magic() == magic);
 	transaction_manager->add_segment_manager(sm.get());
 	secondaries.emplace_back(std::move(sm));
@@ -239,7 +243,7 @@ SeaStore::mkfs_ertr::future<> SeaStore::mkfs(uuid_d new_osd_fsid)
                 device_type_t dtype =
                   string_to_device_type(
                     entry_name.substr(6, dtype_end - 6));
-                if (!dtype) {
+                if (dtype == device_type_t::NONE) {
                   // invalid device type
                   return seastar::now();
                 }
@@ -482,6 +486,22 @@ SeaStore::read_errorator::future<ceph::bufferlist> SeaStore::readv(
   interval_set<uint64_t>& m,
   uint32_t op_flags)
 {
+  return seastar::do_with(
+    ceph::bufferlist{},
+    [=, &oid, &m](auto &ret) {
+    return crimson::do_for_each(
+      m,
+      [=, &oid, &ret](auto &p) {
+      return read(
+	ch, oid, p.first, p.second, op_flags
+	).safe_then([&ret](auto bl) {
+        ret.claim_append(bl);
+      });
+    }).safe_then([&ret] {
+      return read_errorator::make_ready_future<ceph::bufferlist>
+        (std::move(ret));
+    });
+  });
   return read_errorator::make_ready_future<ceph::bufferlist>();
 }
 
@@ -515,7 +535,8 @@ SeaStore::get_attr_errorator::future<ceph::bufferlist> SeaStore::get_attr(
       }
       return _omap_get_value(
         t,
-        layout.xattr_root.get(onode.get_metadata_hint()),
+        layout.xattr_root.get(
+          onode.get_metadata_hint(segment_manager->get_block_size())),
         name);
     }
   ).handle_error(crimson::ct_error::input_output_error::handle([FNAME] {
@@ -614,7 +635,7 @@ SeaStore::omap_get_values(
     op_type_t::OMAP_GET_VALUES,
     [this, keys](auto &t, auto &onode) {
       omap_root_t omap_root = onode.get_layout().omap_root.get(
-	onode.get_metadata_hint());
+	onode.get_metadata_hint(segment_manager->get_block_size()));
       return _omap_get_values(
 	t,
 	std::move(omap_root),
@@ -692,7 +713,8 @@ SeaStore::_omap_list_ret SeaStore::_omap_list(
   const std::optional<std::string>& start,
   OMapManager::omap_list_config_t config) const
 {
-  auto root = omap_root.get(onode.get_metadata_hint());
+  auto root = omap_root.get(
+    onode.get_metadata_hint(segment_manager->get_block_size()));
   if (root.is_null()) {
     return seastar::make_ready_future<_omap_list_bare_ret>(
       true, omap_values_t{}
@@ -849,13 +871,53 @@ seastar::future<FuturizedStore::OmapIteratorRef> SeaStore::get_omap_iterator(
   });
 }
 
+SeaStore::_fiemap_ret SeaStore::_fiemap(
+  Transaction &t,
+  Onode &onode,
+  uint64_t off,
+  uint64_t len) const
+{
+  return seastar::do_with(
+    ObjectDataHandler(max_object_size),
+    [=, &t, &onode] (auto &objhandler) {
+    return objhandler.fiemap(
+      ObjectDataHandler::context_t{
+        *transaction_manager,
+        t,
+        onode,
+      },
+      off,
+      len);
+  });
+}
 seastar::future<std::map<uint64_t, uint64_t>> SeaStore::fiemap(
   CollectionRef ch,
   const ghobject_t& oid,
   uint64_t off,
   uint64_t len)
 {
-  return seastar::make_ready_future<std::map<uint64_t, uint64_t>>();
+  LOG_PREFIX(SeaStore::fiemap);
+  DEBUG("oid: {}, off: {}, len: {} ", oid, off, len);
+  return repeat_with_onode<std::map<uint64_t, uint64_t>>(
+    ch,
+    oid,
+    Transaction::src_t::READ,
+    "fiemap_read",
+    op_type_t::READ,
+    [=](auto &t, auto &onode) -> _fiemap_ret {
+    size_t size = onode.get_layout().size;
+    if (off >= size) {
+      INFOT("fiemap offset is over onode size!", t);
+      return seastar::make_ready_future<std::map<uint64_t, uint64_t>>();
+    }
+    size_t adjust_len = (len == 0) ?
+      size - off:
+      std::min(size - off, len);
+    return _fiemap(t, onode, off, adjust_len);
+  }).handle_error(
+    crimson::ct_error::assert_all{
+      "Invalid error in SeaStore::fiemap"
+  });
 }
 
 void SeaStore::on_error(ceph::os::Transaction &t) {
@@ -919,6 +981,20 @@ seastar::future<> SeaStore::do_transaction(
           }
         }
         return seastar::now();
+      });
+    });
+}
+
+
+seastar::future<> SeaStore::flush(CollectionRef ch)
+{
+  return seastar::do_with(
+    get_dummy_ordering_handle(),
+    [this, ch](auto &handle) {
+      return handle.take_collection_lock(
+	static_cast<SeastoreCollection&>(*ch).ordering_lock
+      ).then([this, &handle] {
+	return transaction_manager->flush(handle);
       });
     });
 }
@@ -1071,8 +1147,9 @@ SeaStore::tm_ret SeaStore::_write(
   }
   return seastar::do_with(
     std::move(_bl),
-    [=, &ctx, &onode](auto &bl) {
-      return ObjectDataHandler(max_object_size).write(
+    ObjectDataHandler(max_object_size),
+    [=, &ctx, &onode](auto &bl, auto &objhandler) {
+      return objhandler.write(
         ObjectDataHandler::context_t{
           *transaction_manager,
           *ctx.transaction,
@@ -1093,13 +1170,13 @@ SeaStore::_omap_set_kvs(
 {
   return seastar::do_with(
     BtreeOMapManager(*transaction_manager),
-    omap_root.get(onode->get_metadata_hint()),
+    omap_root.get(onode->get_metadata_hint(segment_manager->get_block_size())),
     [&, keys=std::move(kvs)](auto &omap_manager, auto &root) {
       tm_iertr::future<> maybe_create_root =
         !root.is_null() ?
         tm_iertr::now() :
         omap_manager.initialize_omap(
-          t, onode->get_metadata_hint()
+          t, onode->get_metadata_hint(segment_manager->get_block_size())
         ).si_then([&root](auto new_root) {
           root = new_root;
         });
@@ -1150,13 +1227,15 @@ SeaStore::tm_ret SeaStore::_omap_rmkeys(
 {
   LOG_PREFIX(SeaStore::_omap_rmkeys);
   DEBUGT("{} {} keys", *ctx.transaction, *onode, keys.size());
-  auto omap_root = onode->get_layout().omap_root.get(onode->get_metadata_hint());
+  auto omap_root = onode->get_layout().omap_root.get(
+    onode->get_metadata_hint(segment_manager->get_block_size()));
   if (omap_root.is_null()) {
     return seastar::now();
   } else {
     return seastar::do_with(
       BtreeOMapManager(*transaction_manager),
-      onode->get_layout().omap_root.get(onode->get_metadata_hint()),
+      onode->get_layout().omap_root.get(
+        onode->get_metadata_hint(segment_manager->get_block_size())),
       std::move(keys),
       [&ctx, &onode](
 	auto &omap_manager,
@@ -1202,13 +1281,17 @@ SeaStore::tm_ret SeaStore::_truncate(
   LOG_PREFIX(SeaStore::_truncate);
   DEBUGT("onode={} size={}", *ctx.transaction, *onode, size);
   onode->get_mutable_layout(*ctx.transaction).size = size;
-  return ObjectDataHandler(max_object_size).truncate(
-    ObjectDataHandler::context_t{
-      *transaction_manager,
-      *ctx.transaction,
-      *onode
-    },
-    size);
+  return seastar::do_with(
+    ObjectDataHandler(max_object_size),
+    [=, &ctx, &onode](auto &objhandler) {
+    return objhandler.truncate(
+      ObjectDataHandler::context_t{
+        *transaction_manager,
+        *ctx.transaction,
+        *onode
+      },
+      size);
+  });
 }
 
 SeaStore::tm_ret SeaStore::_setattrs(
@@ -1395,10 +1478,9 @@ seastar::future<std::unique_ptr<SeaStore>> make_seastore(
       false /* detailed */);
 
     auto journal = std::make_unique<Journal>(*sm, scanner_ref);
-    auto cache = std::make_unique<Cache>(scanner_ref);
+    auto epm = std::make_unique<ExtentPlacementManager>();
+    auto cache = std::make_unique<Cache>(scanner_ref, *epm);
     auto lba_manager = lba_manager::create_lba_manager(*sm, *cache);
-
-    auto epm = std::make_unique<ExtentPlacementManager>(*cache, *lba_manager);
 
     journal->set_segment_provider(&*segment_cleaner);
 

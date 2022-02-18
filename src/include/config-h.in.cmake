@@ -108,9 +108,6 @@
 /* Define to 1 if you have libxfs */
 #cmakedefine HAVE_LIBXFS 1
 
-/* Define to 1 if zns support enabled */
-#cmakedefine HAVE_ZNS
-
 /* SPDK conditional compilation */
 #cmakedefine HAVE_SPDK
 
@@ -353,6 +350,9 @@
 
 /* Backend dbstore for Rados Gateway */
 #cmakedefine WITH_RADOSGW_DBSTORE
+
+/* Backend CORTX-Motr for Rados Gateway */
+#cmakedefine WITH_RADOSGW_MOTR
 
 /* Defined if std::map::merge() is supported */
 #cmakedefine HAVE_STDLIB_MAP_SPLICING

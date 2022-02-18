@@ -277,6 +277,11 @@ public:
     return !is_valid() || (prior_instance && !prior_instance->is_valid());
   }
 
+  /// Returns true if extent is a plcaeholder
+  bool is_placeholder() const {
+    return get_type() == extent_types_t::RETIRED_PLACEHOLDER;
+  }
+
   /// Return journal location of oldest relevant delta, only valid while DIRTY
   auto get_dirty_from() const {
     ceph_assert(is_dirty());
@@ -329,9 +334,6 @@ public:
   }
 
   virtual ~CachedExtent();
-
-  /// type of the backend device that will hold this extent
-  device_type_t backend_type = device_type_t::NONE;
 
   /// hint for allocators
   placement_hint_t hint = placement_hint_t::NUM_HINTS;
@@ -541,7 +543,7 @@ class ExtentIndex {
   friend class Cache;
   CachedExtent::index extent_index;
 public:
-  auto get_overlap(paddr_t addr, segment_off_t len) {
+  auto get_overlap(paddr_t addr, seastore_off_t len) {
     auto bottom = extent_index.upper_bound(addr, paddr_cmp());
     if (bottom != extent_index.begin())
       --bottom;

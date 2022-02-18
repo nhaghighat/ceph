@@ -425,7 +425,11 @@ class CephadmServe:
                                     s.get('type'), s.get('id')
                                 )
                             )
-
+                    if s.get('type') == 'tcmu-runner':
+                        # because we don't track tcmu-runner daemons in the host cache
+                        # and don't have a way to check if the daemon is part of iscsi service
+                        # we assume that all tcmu-runner daemons are managed by cephadm
+                        managed.append(name)
                     if host not in self.mgr.inventory:
                         missing_names.append(name)
                         host_num_daemons += 1
@@ -820,7 +824,7 @@ class CephadmServe:
         finally:
             if self.mgr.use_agent:
                 # can only send ack to agents if we know for sure port they bound to
-                hosts_altered = set([h for h in hosts_altered if (h in self.mgr.cache.agent_ports and h in [
+                hosts_altered = set([h for h in hosts_altered if (h in self.mgr.agent_cache.agent_ports and h in [
                                     h2.hostname for h2 in self.mgr.cache.get_non_draining_hosts()])])
                 self.mgr.agent_helpers._request_agent_acks(hosts_altered, increment=True)
 
@@ -886,6 +890,12 @@ class CephadmServe:
                 self.log.info('Reconfiguring %s (dependencies changed)...' % (
                     dd.name()))
                 action = 'reconfig'
+            elif spec is not None and hasattr(spec, 'extra_container_args') and dd.extra_container_args != spec.extra_container_args:
+                self.log.debug(
+                    f'{dd.name()} container cli args {dd.extra_container_args} -> {spec.extra_container_args}')
+                self.log.info(f'Redeploying {dd.name()}, (container cli args changed) . . .')
+                dd.extra_container_args = spec.extra_container_args
+                action = 'redeploy'
             elif self.mgr.last_monmap and \
                     self.mgr.last_monmap > last_config and \
                     dd.daemon_type in CEPH_TYPES:
@@ -1095,6 +1105,14 @@ class CephadmServe:
                 if self.mgr.allow_ptrace:
                     daemon_spec.extra_args.append('--allow-ptrace')
 
+                try:
+                    eca = daemon_spec.extra_container_args
+                    if eca:
+                        for a in eca:
+                            daemon_spec.extra_args.append(f'--extra-container-args={a}')
+                except AttributeError:
+                    eca = None
+
                 if self.mgr.cache.host_needs_registry_login(daemon_spec.host) and self.mgr.registry_url:
                     await self._registry_login(daemon_spec.host, json.loads(str(self.mgr.get_store('registry_credentials'))))
 
@@ -1113,15 +1131,17 @@ class CephadmServe:
                             'deployed_by': self.mgr.get_active_mgr_digests(),
                             'rank': daemon_spec.rank,
                             'rank_generation': daemon_spec.rank_generation,
+                            'extra_container_args': eca
                         }),
                         '--config-json', '-',
                     ] + daemon_spec.extra_args,
                     stdin=json.dumps(daemon_spec.final_config),
-                    image=image)
+                    image=image,
+                )
 
                 if daemon_spec.daemon_type == 'agent':
-                    self.mgr.cache.agent_timestamp[daemon_spec.host] = datetime_now()
-                    self.mgr.cache.agent_counter[daemon_spec.host] = 1
+                    self.mgr.agent_cache.agent_timestamp[daemon_spec.host] = datetime_now()
+                    self.mgr.agent_cache.agent_counter[daemon_spec.host] = 1
 
                 # refresh daemon state?  (ceph daemon reconfig does not need it)
                 if not reconfig or daemon_spec.daemon_type not in CEPH_TYPES:
@@ -1135,9 +1155,14 @@ class CephadmServe:
                             self.mgr.requires_post_actions.add(daemon_spec.name())
                     self.mgr.cache.invalidate_host_daemons(daemon_spec.host)
 
-                self.mgr.cache.update_daemon_config_deps(
-                    daemon_spec.host, daemon_spec.name(), daemon_spec.deps, start_time)
-                self.mgr.cache.save_host(daemon_spec.host)
+                if daemon_spec.daemon_type != 'agent':
+                    self.mgr.cache.update_daemon_config_deps(
+                        daemon_spec.host, daemon_spec.name(), daemon_spec.deps, start_time)
+                    self.mgr.cache.save_host(daemon_spec.host)
+                else:
+                    self.mgr.agent_cache.update_agent_config_deps(
+                        daemon_spec.host, daemon_spec.deps, start_time)
+                    self.mgr.agent_cache.save_agent(daemon_spec.host)
                 msg = "{} {} on host '{}'".format(
                     'Reconfigured' if reconfig else 'Deployed', daemon_spec.name(), daemon_spec.host)
                 if not code:
@@ -1286,6 +1311,11 @@ class CephadmServe:
                         await self._deploy_cephadm_binary(host, addr)
                         out, err, code = await self.mgr.ssh._execute_command(
                             host, cmd, stdin=stdin, addr=addr)
+                        # if there is an agent on this host, make sure it is using the most recent
+                        # vesion of cephadm binary
+                        if host in self.mgr.inventory:
+                            for agent in self.mgr.cache.get_daemons_by_type('agent', host):
+                                self.mgr._schedule_daemon_action(agent.name(), 'redeploy')
 
             except Exception as e:
                 await self.mgr.ssh._reset_con(host)

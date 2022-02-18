@@ -54,7 +54,8 @@ from .services.osd import OSDRemovalQueue, OSDService, OSD, NotFoundError
 from .services.monitoring import GrafanaService, AlertmanagerService, PrometheusService, \
     NodeExporterService, SNMPGatewayService
 from .schedule import HostAssignment
-from .inventory import Inventory, SpecStore, HostCache, EventStore, ClientKeyringStore, ClientKeyringSpec
+from .inventory import Inventory, SpecStore, HostCache, AgentCache, EventStore, \
+    ClientKeyringStore, ClientKeyringSpec
 from .upgrade import CephadmUpgrade
 from .template import TemplateMgr
 from .utils import CEPH_IMAGE_TYPES, forall_hosts, cephadmNoImage
@@ -63,7 +64,7 @@ from .configchecks import CephadmConfigChecks
 try:
     import asyncssh
 except ImportError as e:
-    asyncssh = None
+    asyncssh = None  # type: ignore
     asyncssh_import_error = str(e)
 
 logger = logging.getLogger(__name__)
@@ -289,19 +290,19 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'registry_url',
             type='str',
             default=None,
-            desc='Custom repository url'
+            desc='Registry url for login purposes. This is not the default registry'
         ),
         Option(
             'registry_username',
             type='str',
             default=None,
-            desc='Custom repository username'
+            desc='Custom repository username. Only used for logging into a registry.'
         ),
         Option(
             'registry_password',
             type='str',
             default=None,
-            desc='Custom repository password'
+            desc='Custom repository password. Only used for logging into a registry.'
         ),
         ####
         Option(
@@ -326,7 +327,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'default_registry',
             type='str',
             default='docker.io',
-            desc='Registry to which we should normalize unqualified image names',
+            desc='Search-registry to which we should normalize unqualified image names. '
+                 'This is not the default registry',
         ),
         Option(
             'max_count_per_host',
@@ -473,6 +475,9 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
 
         self.cache = HostCache(self)
         self.cache.load()
+
+        self.agent_cache = AgentCache(self)
+        self.agent_cache.load()
 
         self.to_remove_osds = OSDRemovalQueue(self)
         self.to_remove_osds.load_from_store()
@@ -737,6 +742,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             sd.rank = int(d['rank']) if d.get('rank') is not None else None
             sd.rank_generation = int(d['rank_generation']) if d.get(
                 'rank_generation') is not None else None
+            sd.extra_container_args = d.get('extra_container_args')
             if 'state' in d:
                 sd.status_desc = d['state']
                 sd.status = {
@@ -761,9 +767,10 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
     def update_failed_daemon_health_check(self) -> None:
         failed_daemons = []
         for dd in self.cache.get_error_daemons():
-            failed_daemons.append('daemon %s on %s is in %s state' % (
-                dd.name(), dd.hostname, dd.status_desc
-            ))
+            if dd.daemon_type != 'agent':  # agents tracked by CEPHADM_AGENT_DOWN
+                failed_daemons.append('daemon %s on %s is in %s state' % (
+                    dd.name(), dd.hostname, dd.status_desc
+                ))
         self.remove_health_warning('CEPHADM_FAILED_DAEMON')
         if failed_daemons:
             self.set_health_warning('CEPHADM_FAILED_DAEMON', f'{len(failed_daemons)} failed cephadm daemon(s)', len(
@@ -1732,9 +1739,16 @@ Then run the following:
                 continue
             if service_name is not None and service_name != nm:
                 continue
+
+            if spec.service_type != 'osd':
+                size = spec.placement.get_target_count(self.cache.get_schedulable_hosts())
+            else:
+                # osd counting is special
+                size = 0
+
             sm[nm] = orchestrator.ServiceDescription(
                 spec=spec,
-                size=spec.placement.get_target_count(self.cache.get_schedulable_hosts()),
+                size=size,
                 running=0,
                 events=self.events.get_for_service(spec.service_name()),
                 created=self.spec_store.spec_created[nm],
@@ -2405,7 +2419,7 @@ Then run the following:
     @handle_orch_error
     def plan(self, specs: Sequence[GenericSpec]) -> List:
         results = [{'warning': 'WARNING! Dry-Runs are snapshots of a certain point in time and are bound \n'
-                               'to the current inventory setup. If any on these conditions changes, the \n'
+                               'to the current inventory setup. If any of these conditions change, the \n'
                                'preview will be invalid. Please make sure to have a minimal \n'
                                'timeframe between planning and applying the specs.'}]
         if any([spec.service_type == 'host' for spec in specs]):

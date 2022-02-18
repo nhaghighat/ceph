@@ -196,12 +196,6 @@ if(WITH_ZFS)
   set(HAVE_LIBZFS ${ZFS_FOUND})
 endif()
 
-option(WITH_ZNS "enable zns support" OFF)
-if (WITH_ZNS)
-  # TODO: add detection, need kernel header >= 5.5
-  set(HAVE_ZNS ON)
-endif()
-
 option(WITH_BLUESTORE "Bluestore OSD backend" ON)
 if(WITH_BLUESTORE)
   if(LINUX)
@@ -400,6 +394,8 @@ option(WITH_RADOSGW_AMQP_ENDPOINT "Rados Gateway's pubsub support for AMQP push 
 option(WITH_RADOSGW_KAFKA_ENDPOINT "Rados Gateway's pubsub support for Kafka push endpoint" ON)
 option(WITH_RADOSGW_LUA_PACKAGES "Rados Gateway's support for dynamically adding lua packagess" ON)
 option(WITH_RADOSGW_DBSTORE "DBStore backend for Rados Gateway" ON)
+option(WITH_RADOSGW_MOTR "CORTX-Motr backend for Rados Gateway" OFF)
+option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" OFF)
 
 if(WITH_RADOSGW)
   find_package(EXPAT REQUIRED)
@@ -667,8 +663,6 @@ option(WITH_SYSTEMD "build with systemd support" ON)
 add_subdirectory(src)
 
 add_subdirectory(qa)
-add_subdirectory(monitoring)
-
 add_subdirectory(doc)
 if(WITH_MANPAGE)
   add_subdirectory(man)
@@ -683,9 +677,7 @@ if(LINUX)
 endif()
 
 option(WITH_GRAFANA "install grafana dashboards" OFF)
-if(WITH_GRAFANA)
-  add_subdirectory(monitoring/grafana/dashboards)
-endif()
+add_subdirectory(monitoring/ceph-mixin)
 
 CMAKE_DEPENDENT_OPTION(WITH_BOOST_VALGRIND "Boost support for valgrind" OFF
   "NOT WITH_SYSTEM_BOOST" OFF)

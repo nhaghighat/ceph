@@ -435,13 +435,30 @@ class TestCephadm(object):
                 _run_cephadm.assert_called_with(
                     'test', 'mon.test', 'deploy', [
                         '--name', 'mon.test',
-                        '--meta-json', '{"service_name": "mon", "ports": [], "ip": null, "deployed_by": [], "rank": null, "rank_generation": null}',
+                        '--meta-json', '{"service_name": "mon", "ports": [], "ip": null, "deployed_by": [], "rank": null, "rank_generation": null, "extra_container_args": null}',
                         '--config-json', '-',
                         '--reconfig',
                     ],
                     stdin='{"config": "\\n\\n[mon]\\nk=v\\n[mon.test]\\npublic network = 127.0.0.0/8\\n", '
                     + '"keyring": "", "files": {"config": "[mon.test]\\npublic network = 127.0.0.0/8\\n"}}',
                     image='')
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_extra_container_args(self, _run_cephadm, cephadm_module: CephadmOrchestrator):
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, ServiceSpec(service_type='crash', extra_container_args=['--cpus=2', '--quiet']), CephadmOrchestrator.apply_crash):
+                _run_cephadm.assert_called_with(
+                    'test', 'crash.test', 'deploy', [
+                        '--name', 'crash.test',
+                        '--meta-json', '{"service_name": "crash", "ports": [], "ip": null, "deployed_by": [], "rank": null, "rank_generation": null, "extra_container_args": ["--cpus=2", "--quiet"]}',
+                        '--config-json', '-',
+                        '--extra-container-args=--cpus=2',
+                        '--extra-container-args=--quiet'
+                    ],
+                    stdin='{"config": "", "keyring": ""}',
+                    image='',
+                )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
     def test_daemon_check_post(self, cephadm_module: CephadmOrchestrator):
@@ -1664,6 +1681,15 @@ Traceback (most recent call last):
 
             with with_osd_daemon(cephadm_module, _run_cephadm, 'test', 1, ceph_volume_lvm_list=_ceph_volume_list):
                 pass
+
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
+    def test_osd_count(self, _run_cephadm, cephadm_module: CephadmOrchestrator):
+        _run_cephadm.side_effect = async_side_effect(('{}', '', 0))
+        dg = DriveGroupSpec(service_id='', data_devices=DeviceSelection(all=True))
+        with with_host(cephadm_module, 'test', refresh_hosts=False):
+            with with_service(cephadm_module, dg, host='test'):
+                with with_osd_daemon(cephadm_module, _run_cephadm, 'test', 1):
+                    assert wait(cephadm_module, cephadm_module.describe_service())[0].size == 1
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
     def test_host_rm_last_admin(self, cephadm_module: CephadmOrchestrator):

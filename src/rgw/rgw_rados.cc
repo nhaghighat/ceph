@@ -52,8 +52,6 @@
 
 #include "common/Clock.h"
 
-using namespace librados;
-
 #include <string>
 #include <iostream>
 #include <vector>
@@ -101,6 +99,8 @@ using namespace librados;
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
+using namespace std;
+using namespace librados;
 
 static string shadow_ns = "shadow";
 static string default_bucket_index_pool_suffix = "rgw.buckets.index";
@@ -611,10 +611,16 @@ public:
   }
   int process(const DoutPrefixProvider *dpp) override {
     list<RGWCoroutinesStack*> stacks;
+    auto metatrimcr = create_meta_log_trim_cr(this, static_cast<rgw::sal::RadosStore*>(store), &http,
+					      cct->_conf->rgw_md_log_max_shards,
+					      trim_interval);
+    if (!metatrimcr) {
+      ldpp_dout(dpp, -1) << "Bailing out of trim thread!" << dendl;
+      return -EINVAL;
+    }
     auto meta = new RGWCoroutinesStack(store->ctx(), &crs);
-    meta->call(create_meta_log_trim_cr(this, static_cast<rgw::sal::RadosStore*>(store), &http,
-                                       cct->_conf->rgw_md_log_max_shards,
-                                       trim_interval));
+    meta->call(metatrimcr);
+
     stacks.push_back(meta);
 
     if (store->svc()->zone->sync_module_exports_data()) {
@@ -1311,8 +1317,10 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
       sync_log_trimmer->start();
     }
   }
-  data_notifier = new RGWDataNotifier(this);
-  data_notifier->start();
+  if (cct->_conf->rgw_data_notify_interval_msec) {
+    data_notifier = new RGWDataNotifier(this);
+    data_notifier->start();
+  }
 
   binfo_cache = new RGWChainedCacheImpl<bucket_info_entry>;
   binfo_cache->init(svc.cache);
@@ -3664,6 +3672,7 @@ int RGWRados::rewrite_obj(rgw::sal::Object* obj, const DoutPrefixProvider *dpp, 
 
   attrset.erase(RGW_ATTR_ID_TAG);
   attrset.erase(RGW_ATTR_TAIL_TAG);
+  attrset.erase(RGW_ATTR_STORAGE_CLASS);
 
   return store->getRados()->copy_obj_data(rctx, obj->get_bucket(),
 					  obj->get_bucket()->get_info().placement_rule,

@@ -130,19 +130,20 @@ PG::PG(
 PG::~PG() {}
 
 bool PG::try_flush_or_schedule_async() {
-  (void)shard_services.get_store().do_transaction(
-    coll_ref,
-    ObjectStore::Transaction()).then(
-      [this, epoch=get_osdmap_epoch()]() {
-	return shard_services.start_operation<LocalPeeringEvent>(
-	  this,
-	  shard_services,
-	  pg_whoami,
-	  pgid,
-	  epoch,
-	  epoch,
-	  PeeringState::IntervalFlush());
-      });
+  logger().debug("PG::try_flush_or_schedule_async: flush ...");
+  (void)shard_services.get_store().flush(
+    coll_ref
+  ).then(
+    [this, epoch=get_osdmap_epoch()]() {
+      return shard_services.start_operation<LocalPeeringEvent>(
+	this,
+	shard_services,
+	pg_whoami,
+	pgid,
+	epoch,
+	epoch,
+	PeeringState::IntervalFlush());
+    });
   return false;
 }
 
@@ -682,7 +683,6 @@ PG::do_osd_ops_execute(
       ox->get_target());
     peering_state.apply_op_stats(ox->get_target(), ox->get_stats());
     return std::move(*ox).flush_changes_n_do_ops_effects(
-      Ref<PG>{this},
       [this, &op_info, &ops] (auto&& txn,
                               auto&& obc,
                               auto&& osd_op_p,
@@ -750,7 +750,7 @@ PG::do_osd_ops(
   }
   return do_osd_ops_execute<MURef<MOSDOpReply>>(
     seastar::make_lw_shared<OpsExecuter>(
-      std::move(obc), op_info, get_pool().info, get_backend(), *m),
+      Ref<PG>{this}, std::move(obc), op_info, *m),
     m->ops,
     op_info,
     [this, m, rvec = op_info.allows_returnvec()] {
@@ -794,7 +794,7 @@ PG::do_osd_ops(
 {
   return do_osd_ops_execute<void>(
     seastar::make_lw_shared<OpsExecuter>(
-      std::move(obc), op_info, get_pool().info, get_backend(), msg_params),
+      Ref<PG>{this}, std::move(obc), op_info, msg_params),
     ops,
     std::as_const(op_info),
     std::move(success_func),
@@ -1100,6 +1100,7 @@ PG::interruptible_future<> PG::handle_rep_op(Ref<MOSDRepOp> req)
   decode(log_entries, p);
   peering_state.append_log(std::move(log_entries), req->pg_trim_to,
       req->version, req->min_last_complete_ondisk, txn, !txn.empty(), false);
+  logger().debug("PG::handle_rep_op: do_transaction...");
   return interruptor::make_interruptible(shard_services.get_store().do_transaction(
 	coll_ref, std::move(txn))).then_interruptible(
       [req, lcod=peering_state.get_info().last_complete, this] {

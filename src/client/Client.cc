@@ -802,7 +802,7 @@ void Client::update_inode_file_size(Inode *in, int issued, uint64_t size,
 
       // truncate cached file data
       if (prior_size > size) {
-	_invalidate_inode_cache(in, truncate_size, prior_size - truncate_size);
+	_invalidate_inode_cache(in, size, prior_size - size);
       }
     }
 
@@ -954,6 +954,7 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
     in->btime = st->btime;
     in->snap_btime = st->snap_btime;
     in->snap_metadata = st->snap_metadata;
+    in->fscrypt_auth = st->fscrypt_auth;
   }
 
   if ((new_version || (new_issued & CEPH_CAP_LINK_SHARED)) &&
@@ -969,6 +970,7 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
   if (new_version ||
       (new_issued & (CEPH_CAP_ANY_FILE_RD | CEPH_CAP_ANY_FILE_WR))) {
     in->layout = st->layout;
+    in->fscrypt_file = st->fscrypt_file;
     update_inode_file_size(in, issued, st->size, st->truncate_seq, st->truncate_size);
   }
 
@@ -1050,7 +1052,6 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
     in->snap_caps |= st->cap.caps;
   }
 
-  in->fscrypt = st->fscrypt;
   return in;
 }
 
@@ -2415,6 +2416,8 @@ ref_t<MClientRequest> Client::build_client_request(MetaRequest *request)
   req->set_filepath2(request->get_filepath2());
   req->set_alternate_name(request->alternate_name);
   req->set_data(request->data);
+  req->fscrypt_auth = request->fscrypt_auth;
+  req->fscrypt_file = request->fscrypt_file;
   req->set_retry_attempt(request->retry_attempt++);
   req->head.num_fwd = request->num_fwd;
   const gid_t *_gids;
@@ -3495,8 +3498,10 @@ int Client::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
       waitfor_caps = true;
     }
 
-    if ((need & CEPH_CAP_FILE_WR) && in->auth_cap &&
-	in->auth_cap->session->readonly)
+    if ((need & CEPH_CAP_FILE_WR) &&
+	((in->auth_cap && in->auth_cap->session->readonly) ||
+	 // userland clients are only allowed to read if fscrypt enabled
+	 in->is_fscrypt_enabled()))
       return -CEPHFS_EROFS;
 
     if (in->flags & I_CAP_DROPPED) {
@@ -3621,6 +3626,8 @@ void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
   m->btime = in->btime;
   m->time_warp_seq = in->time_warp_seq;
   m->change_attr = in->change_attr;
+  m->fscrypt_auth = in->fscrypt_auth;
+  m->fscrypt_file = in->fscrypt_file;
 
   if (!(flags & MClientCaps::FLAG_PENDING_CAPSNAP) &&
       !in->cap_snaps.empty() &&
@@ -3835,6 +3842,7 @@ void Client::check_caps(Inode *in, unsigned flags)
       flush_tid = 0;
     }
 
+    in->delay_cap_item.remove_myself();
     send_cap(in, session.get(), &cap, msg_flags, cap_used, wanted, retain,
 	     flushing, flush_tid);
   }
@@ -4651,35 +4659,25 @@ void Client::adjust_session_flushing_caps(Inode *in, MetaSession *old_s,  MetaSe
 }
 
 /*
- * Flush all caps back to the MDS. Because the callers generally wait on the
- * result of this function (syncfs and umount cases), we set
- * CHECK_CAPS_SYNCHRONOUS on the last check_caps call.
+ * Flush all the dirty caps back to the MDS. Because the callers
+ * generally wait on the result of this function (syncfs and umount
+ * cases), we set CHECK_CAPS_SYNCHRONOUS on the last check_caps call.
  */
 void Client::flush_caps_sync()
 {
   ldout(cct, 10) << __func__ << dendl;
-  xlist<Inode*>::iterator p = delayed_list.begin();
-  while (!p.end()) {
-    unsigned flags = CHECK_CAPS_NODELAY;
-    Inode *in = *p;
+  for (auto &q : mds_sessions) {
+    auto s = q.second;
+    xlist<Inode*>::iterator p = s->dirty_list.begin();
+    while (!p.end()) {
+      unsigned flags = CHECK_CAPS_NODELAY;
+      Inode *in = *p;
 
-    ++p;
-    delayed_list.pop_front();
-    if (p.end() && dirty_list.empty())
-      flags |= CHECK_CAPS_SYNCHRONOUS;
-    check_caps(in, flags);
-  }
-
-  // other caps, too
-  p = dirty_list.begin();
-  while (!p.end()) {
-    unsigned flags = CHECK_CAPS_NODELAY;
-    Inode *in = *p;
-
-    ++p;
-    if (p.end())
-      flags |= CHECK_CAPS_SYNCHRONOUS;
-    check_caps(in, flags);
+      ++p;
+      if (p.end())
+        flags |= CHECK_CAPS_SYNCHRONOUS;
+      check_caps(in, flags);
+    }
   }
 }
 
@@ -5218,15 +5216,20 @@ void Client::handle_cap_trunc(MetaSession *session, Inode *in, const MConstRef<M
   mds_rank_t mds = session->mds_num;
   ceph_assert(in->caps.count(mds));
 
+  uint64_t size = m->get_size();
+  if (in->is_fscrypt_enabled()) {
+    size = std::stoll(std::string(std::rbegin(m->fscrypt_file),
+                                  std::rend(m->fscrypt_file)));
+  }
   ldout(cct, 10) << __func__ << " on ino " << *in
 	   << " size " << in->size << " -> " << m->get_size()
 	   << dendl;
-  
+
   int issued;
   in->caps_issued(&issued);
   issued |= in->caps_dirty();
-  update_inode_file_size(in, issued, m->get_size(),
-			 m->get_truncate_seq(), m->get_truncate_size());
+  update_inode_file_size(in, issued, size, m->get_truncate_seq(),
+                         m->get_truncate_size());
 }
 
 void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, const MConstRef<MClientCaps>& m)
@@ -5461,8 +5464,7 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   if ((new_caps & CEPH_CAP_LINK_SHARED) &&
       !(issued & CEPH_CAP_LINK_EXCL)) {
     in->nlink = m->head.nlink;
-    if (in->nlink == 0 &&
-	(new_caps & (CEPH_CAP_LINK_SHARED | CEPH_CAP_LINK_EXCL)))
+    if (in->nlink == 0)
       deleted_inode = true;
   }
   if (!(issued & CEPH_CAP_XATTR_EXCL) &&
@@ -6454,13 +6456,16 @@ void Client::_unmount(bool abort)
   }
 
   if (abort || blocklisted) {
-    for (auto p = dirty_list.begin(); !p.end(); ) {
-      Inode *in = *p;
-      ++p;
-      if (in->dirty_caps) {
-	ldout(cct, 0) << " drop dirty caps on " << *in << dendl;
-	in->mark_caps_clean();
-	put_inode(in);
+    for (auto &q : mds_sessions) {
+      auto s = q.second;
+      for (auto p = s->dirty_list.begin(); !p.end(); ) {
+        Inode *in = *p;
+        ++p;
+        if (in->dirty_caps) {
+          ldout(cct, 0) << " drop dirty caps on " << *in << dendl;
+          in->mark_caps_clean();
+          put_inode(in);
+        }
       }
     }
   } else {
@@ -7449,12 +7454,20 @@ int Client::_getattr(Inode *in, int mask, const UserPerm& perms, bool force)
 }
 
 int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
-			const UserPerm& perms, InodeRef *inp)
+			const UserPerm& perms, InodeRef *inp,
+			std::vector<uint8_t>* aux)
 {
   int issued = in->caps_issued();
+  union ceph_mds_request_args args;
+  bool kill_sguid = false;
+  int inode_drop = 0;
+  size_t auxsize = 0;
+
+  if (aux)
+    auxsize = aux->size();
 
   ldout(cct, 10) << __func__ << " mask " << mask << " issued " <<
-    ccap_string(issued) << dendl;
+    ccap_string(issued) <<  " aux size " << auxsize << dendl;
 
   if (in->snapid != CEPH_NOSNAP) {
     return -CEPHFS_EROFS;
@@ -7465,6 +7478,16 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
 			      perms)) {
     return -CEPHFS_EDQUOT;
   }
+
+  // Can't set fscrypt_auth and file at the same time!
+  if ((mask & (CEPH_SETATTR_FSCRYPT_AUTH|CEPH_SETATTR_FSCRYPT_FILE)) ==
+      (CEPH_SETATTR_FSCRYPT_AUTH|CEPH_SETATTR_FSCRYPT_FILE))
+    return -CEPHFS_EINVAL;
+
+  if (!aux && (mask & (CEPH_SETATTR_FSCRYPT_AUTH|CEPH_SETATTR_FSCRYPT_FILE)))
+    return -CEPHFS_EINVAL;
+
+  memset(&args, 0, sizeof(args));
 
   // make the change locally?
   if ((in->cap_dirtier_uid >= 0 && perms.uid() != in->cap_dirtier_uid) ||
@@ -7484,9 +7507,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
      * case later, we can build a more complex pipelined cap writeback
      * infrastructure...
      */
-    if (!mask)
-      mask |= CEPH_SETATTR_CTIME;
-    goto force_request;
+    mask |= CEPH_SETATTR_CTIME;
   }
 
   if (!mask) {
@@ -7505,11 +7526,19 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   }
 
   if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
-    bool kill_sguid = mask & (CEPH_SETATTR_SIZE|CEPH_SETATTR_KILL_SGUID);
+    kill_sguid = mask & (CEPH_SETATTR_SIZE|CEPH_SETATTR_KILL_SGUID);
 
     mask &= ~CEPH_SETATTR_KILL_SGUID;
+  } else if (mask & CEPH_SETATTR_SIZE) {
+    /* If we don't have Ax, then we must ask the server to clear them on truncate */
+    mask |= CEPH_SETATTR_KILL_SGUID;
+    inode_drop |= CEPH_CAP_AUTH_SHARED;
+  }
 
-    if (mask & CEPH_SETATTR_UID) {
+  if (mask & CEPH_SETATTR_UID) {
+    ldout(cct,10) << "changing uid to " << stx->stx_uid << dendl;
+
+    if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->cap_dirtier_uid = perms.uid();
       in->cap_dirtier_gid = perms.gid();
@@ -7517,9 +7546,19 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_UID;
       kill_sguid = true;
-      ldout(cct,10) << "changing uid to " << stx->stx_uid << dendl;
+    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+               in->uid != stx->stx_uid) {
+      args.setattr.uid = stx->stx_uid;
+      inode_drop |= CEPH_CAP_AUTH_SHARED;
+    } else {
+      mask &= ~CEPH_SETATTR_UID;
     }
-    if (mask & CEPH_SETATTR_GID) {
+  }
+
+  if (mask & CEPH_SETATTR_GID) {
+    ldout(cct,10) << "changing gid to " << stx->stx_gid << dendl;
+
+    if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->cap_dirtier_uid = perms.uid();
       in->cap_dirtier_gid = perms.gid();
@@ -7527,57 +7566,185 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_GID;
       kill_sguid = true;
-      ldout(cct,10) << "changing gid to " << stx->stx_gid << dendl;
+    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+               in->gid != stx->stx_gid) {
+      args.setattr.gid = stx->stx_gid;
+      inode_drop |= CEPH_CAP_AUTH_SHARED;
+    } else {
+      mask &= ~CEPH_SETATTR_GID;
     }
+  }
 
-    if (mask & CEPH_SETATTR_MODE) {
+  if (mask & CEPH_SETATTR_MODE) {
+    ldout(cct,10) << "changing mode to " << stx->stx_mode << dendl;
+
+    if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->cap_dirtier_uid = perms.uid();
       in->cap_dirtier_gid = perms.gid();
       in->mode = (in->mode & ~07777) | (stx->stx_mode & 07777);
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_MODE;
-      ldout(cct,10) << "changing mode to " << stx->stx_mode << dendl;
-    } else if (kill_sguid && S_ISREG(in->mode) && (in->mode & (S_IXUSR|S_IXGRP|S_IXOTH))) {
-      /* Must squash the any setuid/setgid bits with an ownership change */
-      in->mode &= ~(S_ISUID|S_ISGID);
-      in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
+    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+               in->mode != stx->stx_mode) {
+      args.setattr.mode = stx->stx_mode;
+      inode_drop |= CEPH_CAP_AUTH_SHARED;
+    } else {
+      mask &= ~CEPH_SETATTR_MODE;
     }
+  } else if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL) &&
+             kill_sguid && S_ISREG(in->mode) &&
+	     (in->mode & (S_IXUSR|S_IXGRP|S_IXOTH))) {
+    /* Must squash the any setuid/setgid bits with an ownership change */
+    in->mode &= ~(S_ISUID|S_ISGID);
+    in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
+  }
 
-    if (mask & CEPH_SETATTR_BTIME) {
+  if (mask & CEPH_SETATTR_BTIME) {
+    ldout(cct,10) << "changing btime to " << in->btime << dendl;
+
+    if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->cap_dirtier_uid = perms.uid();
       in->cap_dirtier_gid = perms.gid();
       in->btime = utime_t(stx->stx_btime);
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_BTIME;
-      ldout(cct,10) << "changing btime to " << in->btime << dendl;
+    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+               in->btime != utime_t(stx->stx_btime)) {
+      args.setattr.btime = utime_t(stx->stx_btime);
+      inode_drop |= CEPH_CAP_AUTH_SHARED;
+    } else {
+      mask &= ~CEPH_SETATTR_BTIME;
     }
-  } else if (mask & CEPH_SETATTR_SIZE) {
-    /* If we don't have Ax, then we must ask the server to clear them on truncate */
-    mask |= CEPH_SETATTR_KILL_SGUID;
   }
 
-  if (in->caps_issued_mask(CEPH_CAP_FILE_EXCL)) {
-    if (mask & (CEPH_SETATTR_MTIME|CEPH_SETATTR_ATIME)) {
-      if (mask & CEPH_SETATTR_MTIME)
-        in->mtime = utime_t(stx->stx_mtime);
-      if (mask & CEPH_SETATTR_ATIME)
-        in->atime = utime_t(stx->stx_atime);
+  if (mask & CEPH_SETATTR_FSCRYPT_AUTH) {
+    ldout(cct,10) << "resetting cached fscrypt_auth field. size now "
+                  << in->fscrypt_auth.size() << dendl;
+
+    if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
+      in->ctime = ceph_clock_now();
+      in->cap_dirtier_uid = perms.uid();
+      in->cap_dirtier_gid = perms.gid();
+      in->fscrypt_auth = *aux;
+      in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
+      mask &= ~CEPH_SETATTR_FSCRYPT_AUTH;
+    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+               in->fscrypt_auth != *aux) {
+      inode_drop |= CEPH_CAP_AUTH_SHARED;
+    } else {
+      mask &= ~CEPH_SETATTR_FSCRYPT_AUTH;
+    }
+  }
+
+  if (mask & CEPH_SETATTR_SIZE) {
+    if ((uint64_t)stx->stx_size >= mdsmap->get_max_filesize()) {
+      //too big!
+      ldout(cct,10) << "unable to set size to " << stx->stx_size << ". Too large!" << dendl;
+      return -CEPHFS_EFBIG;
+    }
+
+    ldout(cct,10) << "changing size to " << stx->stx_size << dendl;
+    if (in->caps_issued_mask(CEPH_CAP_FILE_EXCL) &&
+        !(mask & CEPH_SETATTR_KILL_SGUID) &&
+        stx->stx_size >= in->size) {
+      if (stx->stx_size > in->size) {
+        in->size = in->reported_size = stx->stx_size;
+        in->cap_dirtier_uid = perms.uid();
+        in->cap_dirtier_gid = perms.gid();
+        in->mark_caps_dirty(CEPH_CAP_FILE_EXCL);
+        mask &= ~(CEPH_SETATTR_SIZE);
+        mask |= CEPH_SETATTR_MTIME;
+      } else {
+        // ignore it when size doesn't change
+        mask &= ~(CEPH_SETATTR_SIZE);
+      }
+    } else {
+      args.setattr.size = stx->stx_size;
+      inode_drop |= CEPH_CAP_FILE_SHARED | CEPH_CAP_FILE_RD |
+                    CEPH_CAP_FILE_WR;
+    }
+  }
+
+  if (mask & CEPH_SETATTR_FSCRYPT_FILE) {
+    ldout(cct,10) << "resetting cached fscrypt_file field. size now "
+                  << in->fscrypt_file.size() << dendl;
+
+    if (in->caps_issued_mask(CEPH_CAP_FILE_EXCL)) {
+      in->ctime = ceph_clock_now();
+      in->cap_dirtier_uid = perms.uid();
+      in->cap_dirtier_gid = perms.gid();
+      in->fscrypt_file = *aux;
+      in->mark_caps_dirty(CEPH_CAP_FILE_EXCL);
+      mask &= ~CEPH_SETATTR_FSCRYPT_FILE;
+    } else if (!in->caps_issued_mask(CEPH_CAP_FILE_SHARED) ||
+               in->fscrypt_file != *aux) {
+      inode_drop |= CEPH_CAP_FILE_SHARED | CEPH_CAP_FILE_RD | CEPH_CAP_FILE_WR;
+    } else {
+      mask &= ~CEPH_SETATTR_FSCRYPT_FILE;
+    }
+  }
+
+  if (mask & CEPH_SETATTR_MTIME) {
+    if (in->caps_issued_mask(CEPH_CAP_FILE_EXCL)) {
+      in->mtime = utime_t(stx->stx_mtime);
       in->ctime = ceph_clock_now();
       in->cap_dirtier_uid = perms.uid();
       in->cap_dirtier_gid = perms.gid();
       in->time_warp_seq++;
       in->mark_caps_dirty(CEPH_CAP_FILE_EXCL);
-      mask &= ~(CEPH_SETATTR_MTIME|CEPH_SETATTR_ATIME);
+      mask &= ~CEPH_SETATTR_MTIME;
+    } else if (in->caps_issued_mask(CEPH_CAP_FILE_WR) &&
+               utime_t(stx->stx_mtime) > in->mtime) {
+      in->mtime = utime_t(stx->stx_mtime);
+      in->ctime = ceph_clock_now();
+      in->cap_dirtier_uid = perms.uid();
+      in->cap_dirtier_gid = perms.gid();
+      in->mark_caps_dirty(CEPH_CAP_FILE_WR);
+      mask &= ~CEPH_SETATTR_MTIME;
+    } else if (!in->caps_issued_mask(CEPH_CAP_FILE_SHARED) ||
+	       in->mtime != utime_t(stx->stx_mtime)) {
+      args.setattr.mtime = utime_t(stx->stx_mtime);
+      inode_drop |= CEPH_CAP_FILE_SHARED | CEPH_CAP_FILE_RD |
+                    CEPH_CAP_FILE_WR;
+    } else {
+      mask &= ~CEPH_SETATTR_MTIME;
     }
   }
+
+  if (mask & CEPH_SETATTR_ATIME) {
+    if (in->caps_issued_mask(CEPH_CAP_FILE_EXCL)) {
+      in->atime = utime_t(stx->stx_atime);
+      in->ctime = ceph_clock_now();
+      in->cap_dirtier_uid = perms.uid();
+      in->cap_dirtier_gid = perms.gid();
+      in->time_warp_seq++;
+      in->mark_caps_dirty(CEPH_CAP_FILE_EXCL);
+      mask &= ~CEPH_SETATTR_ATIME;
+    } else if (in->caps_issued_mask(CEPH_CAP_FILE_WR) &&
+               utime_t(stx->stx_atime) > in->atime) {
+      in->atime = utime_t(stx->stx_atime);
+      in->ctime = ceph_clock_now();
+      in->cap_dirtier_uid = perms.uid();
+      in->cap_dirtier_gid = perms.gid();
+      in->mark_caps_dirty(CEPH_CAP_FILE_WR);
+      mask &= ~CEPH_SETATTR_ATIME;
+    } else if (!in->caps_issued_mask(CEPH_CAP_FILE_SHARED) ||
+	       in->atime != utime_t(stx->stx_atime)) {
+      args.setattr.atime = utime_t(stx->stx_atime);
+      inode_drop |= CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_RD |
+                    CEPH_CAP_FILE_WR;
+    } else {
+      mask &= ~CEPH_SETATTR_ATIME;
+    }
+  }
+
   if (!mask) {
     in->change_attr++;
     return 0;
   }
 
-force_request:
   MetaRequest *req = new MetaRequest(CEPH_MDS_OP_SETATTR);
 
   filepath path;
@@ -7586,52 +7753,14 @@ force_request:
   req->set_filepath(path);
   req->set_inode(in);
 
-  if (mask & CEPH_SETATTR_KILL_SGUID) {
-    req->inode_drop |= CEPH_CAP_AUTH_SHARED;
-  }
-  if (mask & CEPH_SETATTR_MODE) {
-    req->head.args.setattr.mode = stx->stx_mode;
-    req->inode_drop |= CEPH_CAP_AUTH_SHARED;
-    ldout(cct,10) << "changing mode to " << stx->stx_mode << dendl;
-  }
-  if (mask & CEPH_SETATTR_UID) {
-    req->head.args.setattr.uid = stx->stx_uid;
-    req->inode_drop |= CEPH_CAP_AUTH_SHARED;
-    ldout(cct,10) << "changing uid to " << stx->stx_uid << dendl;
-  }
-  if (mask & CEPH_SETATTR_GID) {
-    req->head.args.setattr.gid = stx->stx_gid;
-    req->inode_drop |= CEPH_CAP_AUTH_SHARED;
-    ldout(cct,10) << "changing gid to " << stx->stx_gid << dendl;
-  }
-  if (mask & CEPH_SETATTR_BTIME) {
-    req->head.args.setattr.btime = utime_t(stx->stx_btime);
-    req->inode_drop |= CEPH_CAP_AUTH_SHARED;
-  }
-  if (mask & CEPH_SETATTR_MTIME) {
-    req->head.args.setattr.mtime = utime_t(stx->stx_mtime);
-    req->inode_drop |= CEPH_CAP_FILE_SHARED | CEPH_CAP_FILE_RD |
-      CEPH_CAP_FILE_WR;
-  }
-  if (mask & CEPH_SETATTR_ATIME) {
-    req->head.args.setattr.atime = utime_t(stx->stx_atime);
-    req->inode_drop |= CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_RD |
-      CEPH_CAP_FILE_WR;
-  }
-  if (mask & CEPH_SETATTR_SIZE) {
-    if ((uint64_t)stx->stx_size < mdsmap->get_max_filesize()) {
-      req->head.args.setattr.size = stx->stx_size;
-      ldout(cct,10) << "changing size to " << stx->stx_size << dendl;
-    } else { //too big!
-      put_request(req);
-      ldout(cct,10) << "unable to set size to " << stx->stx_size << ". Too large!" << dendl;
-      return -CEPHFS_EFBIG;
-    }
-    req->inode_drop |= CEPH_CAP_FILE_SHARED | CEPH_CAP_FILE_RD |
-      CEPH_CAP_FILE_WR;
+  req->head.args = args;
+  req->inode_drop = inode_drop;
+  if (mask & CEPH_SETATTR_FSCRYPT_AUTH) {
+    req->fscrypt_auth = *aux;
+  } else if (mask & CEPH_SETATTR_FSCRYPT_FILE) {
+    req->fscrypt_file = *aux;
   }
   req->head.args.setattr.mask = mask;
-
   req->regetattr_mask = mask;
 
   int res = make_request(req, perms, inp);
@@ -12437,7 +12566,7 @@ int Client::_setxattr(Inode *in, const char *name, const void *value,
 	if (new_mode != in->mode) {
 	  struct ceph_statx stx;
 	  stx.stx_mode = new_mode;
-	  ret = _do_setattr(in, &stx, CEPH_SETATTR_MODE, perms, NULL);
+	  ret = _do_setattr(in, &stx, CEPH_SETATTR_MODE, perms, nullptr);
 	  if (ret < 0)
 	    return ret;
 	}
@@ -12462,6 +12591,8 @@ int Client::_setxattr(Inode *in, const char *name, const void *value,
     if (vxattr) {
       if (vxattr->readonly)
 	return -CEPHFS_EOPNOTSUPP;
+      if (vxattr->setxattr_cb)
+	return (this->*(vxattr->setxattr_cb))(in, value, size, perms);
       if (vxattr->name.compare(0, 10, "ceph.quota") == 0 && value)
 	check_realm = true;
     }
@@ -12640,6 +12771,61 @@ int Client::ll_removexattr(Inode *in, const char *name, const UserPerm& perms)
   }
 
   return _removexattr(in, name, perms);
+}
+
+bool Client::_vxattrcb_fscrypt_auth_exists(Inode *in)
+{
+  bool exists = !in->fscrypt_auth.empty();
+
+  ldout(cct, 10) << "fscrypt_auth exists " << exists << dendl;
+  return exists;
+}
+
+size_t Client::_vxattrcb_fscrypt_auth(Inode *in, char *val, size_t size)
+{
+  size_t count = in->fscrypt_auth.size();
+
+  if (count <= size)
+    memcpy(val, in->fscrypt_auth.data(), count);
+  return count;
+}
+
+int Client::_vxattrcb_fscrypt_auth_set(Inode *in, const void *val, size_t size,
+				       const UserPerm& perms)
+{
+  struct ceph_statx stx = { 0 };
+  std::vector<uint8_t>	aux;
+
+  aux.resize(size);
+  memcpy(aux.data(), val, size);
+
+  return _do_setattr(in, &stx, CEPH_SETATTR_FSCRYPT_AUTH, perms, nullptr, &aux);
+}
+
+bool Client::_vxattrcb_fscrypt_file_exists(Inode *in)
+{
+  return !in->fscrypt_file.empty();
+}
+
+size_t Client::_vxattrcb_fscrypt_file(Inode *in, char *val, size_t size)
+{
+  size_t count = in->fscrypt_file.size();
+
+  if (count <= size)
+    memcpy(val, in->fscrypt_file.data(), count);
+  return count;
+}
+
+int Client::_vxattrcb_fscrypt_file_set(Inode *in, const void *val, size_t size,
+				       const UserPerm& perms)
+{
+  struct ceph_statx stx = { 0 };
+  std::vector<uint8_t>	aux;
+
+  aux.resize(size);
+  memcpy(aux.data(), val, size);
+
+  return _do_setattr(in, &stx, CEPH_SETATTR_FSCRYPT_FILE, perms, nullptr, &aux);
 }
 
 bool Client::_vxattrcb_quota_exists(Inode *in)
@@ -12941,6 +13127,22 @@ const Client::VXattr Client::_common_vxattrs[] = {
     getxattr_cb: &Client::_vxattrcb_client_id,
     readonly: true,
     exists_cb: nullptr,
+    flags: 0,
+  },
+  {
+    name: "ceph.fscrypt.auth",
+    getxattr_cb: &Client::_vxattrcb_fscrypt_auth,
+    setxattr_cb: &Client::_vxattrcb_fscrypt_auth_set,
+    readonly: false,
+    exists_cb: &Client::_vxattrcb_fscrypt_auth_exists,
+    flags: 0,
+  },
+  {
+    name: "ceph.fscrypt.file",
+    getxattr_cb: &Client::_vxattrcb_fscrypt_file,
+    setxattr_cb: &Client::_vxattrcb_fscrypt_file_set,
+    readonly: false,
+    exists_cb: &Client::_vxattrcb_fscrypt_file_exists,
     flags: 0,
   },
   { name: "" }     /* Required table terminator */

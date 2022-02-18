@@ -2838,6 +2838,7 @@ void RGWStatBucket::execute(optional_yield y)
   if (op_ret) {
     return;
   }
+  op_ret = bucket->update_container_stats(s);
 }
 
 int RGWListBucket::verify_permission(optional_yield y)
@@ -3904,8 +3905,10 @@ void RGWPutObj::execute(optional_yield y)
   }
 
   // make reservation for notification if needed
-  std::unique_ptr<rgw::sal::Notification> res = store->get_notification(s->object.get(),
-						s, rgw::notify::ObjectCreatedPut);
+  std::unique_ptr<rgw::sal::Notification> res
+		     = store->get_notification(
+		       s->object.get(), s->src_object.get(), s,
+		       rgw::notify::ObjectCreatedPut);
   if(!multipart) {
     op_ret = res->publish_reserve(this, obj_tags.get());
     if (op_ret < 0) {
@@ -4304,7 +4307,8 @@ void RGWPostObj::execute(optional_yield y)
   }
 
   // make reservation for notification if needed
-  std::unique_ptr<rgw::sal::Notification> res = store->get_notification(s->object.get(), s, rgw::notify::ObjectCreatedPost);
+  std::unique_ptr<rgw::sal::Notification> res
+    = store->get_notification(s->object.get(), s->src_object.get(), s, rgw::notify::ObjectCreatedPost);
   op_ret = res->publish_reserve(this);
   if (op_ret < 0) {
     return;
@@ -4400,6 +4404,9 @@ void RGWPostObj::execute(optional_yield y)
 
       hash.Update((const unsigned char *)data.c_str(), data.length());
       op_ret = filter->process(std::move(data), ofs);
+      if (op_ret < 0) {
+        return;
+      }
 
       ofs += len;
 
@@ -4985,10 +4992,13 @@ void RGWDeleteObj::execute(optional_yield y)
 
     // make reservation for notification if needed
     const auto versioned_object = s->bucket->versioning_enabled();
-    const auto event_type = versioned_object && s->object->get_instance().empty() ? 
-        rgw::notify::ObjectRemovedDeleteMarkerCreated : rgw::notify::ObjectRemovedDelete;
-    std::unique_ptr<rgw::sal::Notification> res = store->get_notification(s->object.get(),
-									s, event_type);
+    const auto event_type = versioned_object &&
+      s->object->get_instance().empty() ?
+      rgw::notify::ObjectRemovedDeleteMarkerCreated :
+      rgw::notify::ObjectRemovedDelete;
+    std::unique_ptr<rgw::sal::Notification> res
+      = store->get_notification(s->object.get(), s->src_object.get(), s,
+				event_type);
     op_ret = res->publish_reserve(this);
     if (op_ret < 0) {
       return;
@@ -5388,8 +5398,10 @@ void RGWCopyObj::execute(optional_yield y)
     return;
 
   // make reservation for notification if needed
-  std::unique_ptr<rgw::sal::Notification> res = store->get_notification(s->object.get(),
-						s, rgw::notify::ObjectCreatedCopy);
+  std::unique_ptr<rgw::sal::Notification> res
+				   = store->get_notification(
+				     s->object.get(), s->src_object.get(),
+				     s, rgw::notify::ObjectCreatedCopy);
   op_ret = res->publish_reserve(this);
   if (op_ret < 0) {
     return;
@@ -5442,6 +5454,10 @@ void RGWCopyObj::execute(optional_yield y)
     obj_size = astate->size;
   
     if (!s->system_request) { // no quota enforcement for system requests
+      if (astate->accounted_size > static_cast<size_t>(s->cct->_conf->rgw_max_put_size)) {
+        op_ret = -ERR_TOO_LARGE;
+        return;
+      }
       // enforce quota against the destination bucket owner
       op_ret = dest_bucket->check_quota(this, user_quota, bucket_quota,
 				      astate->accounted_size, y);
@@ -6349,8 +6365,8 @@ void RGWCompleteMultipart::execute(optional_yield y)
   
 
   // make reservation for notification if needed
-  std::unique_ptr<rgw::sal::Notification> res = store->get_notification(meta_obj.get(),
-				s, rgw::notify::ObjectCreatedCompleteMultipartUpload, &s->object->get_name());
+  std::unique_ptr<rgw::sal::Notification> res
+    = store->get_notification(meta_obj.get(), nullptr, s, rgw::notify::ObjectCreatedCompleteMultipartUpload, &s->object->get_name());
   op_ret = res->publish_reserve(this);
   if (op_ret < 0) {
     return;
@@ -6915,10 +6931,11 @@ void RGWDeleteMultiObj::execute(optional_yield y)
 
     // make reservation for notification if needed
     const auto versioned_object = s->bucket->versioning_enabled();
-    const auto event_type = versioned_object && obj->get_instance().empty() ? 
-        rgw::notify::ObjectRemovedDeleteMarkerCreated : rgw::notify::ObjectRemovedDelete;
-    std::unique_ptr<rgw::sal::Notification> res = store->get_notification(obj.get(),
-									s, event_type);
+    const auto event_type = versioned_object && obj->get_instance().empty() ?
+      rgw::notify::ObjectRemovedDeleteMarkerCreated :
+      rgw::notify::ObjectRemovedDelete;
+    std::unique_ptr<rgw::sal::Notification> res
+      = store->get_notification(obj.get(), s->src_object.get(), s, event_type);
     op_ret = res->publish_reserve(this);
     if (op_ret < 0) {
       send_partial_response(*iter, false, "", op_ret);
@@ -7375,9 +7392,10 @@ int RGWBulkUploadOp::handle_file(const std::string_view path,
   ACLOwner bowner;
 
   op_ret = store->get_bucket(this, s->user.get(), rgw_bucket(rgw_bucket_key(s->user->get_tenant(), bucket_name)), &bucket, y);
-  if (op_ret == -ENOENT) {
-    ldpp_dout(this, 20) << "non existent directory=" << bucket_name << dendl;
-  } else if (op_ret < 0) {
+  if (op_ret < 0) {
+    if (op_ret == -ENOENT) {
+      ldpp_dout(this, 20) << "non existent directory=" << bucket_name << dendl;
+    }
     return op_ret;
   }
 
